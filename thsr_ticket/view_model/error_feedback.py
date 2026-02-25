@@ -15,7 +15,5 @@ class ErrorFeedback(AbstractViewModel):
     def parse(self, html: bytes) -> List[Error]:
         page = self._parser(html)
         items = page.find_all(**ERROR_FEEDBACK)
-        for it in items:
-            self.errors.append(Error(it.text))
-
+        self.errors = [Error(it.text) for it in items]
         return self.errors
