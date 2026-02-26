@@ -13,6 +13,8 @@ dependencies = [
     "onnxruntime>=1.10",
     "numpy>=1.20",
     "rich>=13.0",
+    "questionary>=2.0",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]

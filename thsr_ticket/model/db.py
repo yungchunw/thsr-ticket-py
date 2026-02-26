@@ -45,6 +45,12 @@ class ParamDB:
             dicts = db.all()
         return [Record(**d) for d in dicts]   # type: ignore
 
+    def delete(self, idx: int) -> None:
+        with TinyDB(self.db_path) as db:
+            docs = db.all()
+            if 0 <= idx < len(docs):
+                db.remove(doc_ids=[docs[idx].doc_id])
+
     def _compare_hist(self, data: Mapping[str, Any], hist: Iterable[Document]) -> int:
         for idx, h in enumerate(hist):
             comp = [h[k] for k in data.keys() if h[k] == data[k]]

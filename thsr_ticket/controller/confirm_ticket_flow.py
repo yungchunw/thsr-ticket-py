@@ -1,4 +1,6 @@
 import json
+import re
+import questionary
 from typing import Optional, Tuple
 
 from bs4 import BeautifulSoup
@@ -7,7 +9,35 @@ from thsr_ticket.configs.web.param_schema import ConfirmTicketModel
 
 from thsr_ticket.model.db import Record
 from thsr_ticket.remote.http_request import HTTPRequest
-from thsr_ticket.view.console import console
+from thsr_ticket.view.console import console, QUESTIONARY_STYLE
+
+
+_ID_LETTER_MAP = {
+    'A': 10, 'B': 11, 'C': 12, 'D': 13, 'E': 14, 'F': 15, 'G': 16, 'H': 17,
+    'I': 34, 'J': 18, 'K': 19, 'L': 20, 'M': 21, 'N': 22, 'O': 35, 'P': 23,
+    'Q': 24, 'R': 25, 'S': 26, 'T': 27, 'U': 28, 'V': 29, 'W': 32, 'X': 30,
+    'Y': 31, 'Z': 33,
+}
+
+
+def _validate_personal_id(v: str):
+    v = v.strip().upper()
+    if not re.match(r'^[A-Z]\d{9}$', v):
+        return "格式錯誤（英文字母 + 9 碼數字，例：A123456789）"
+    letter_val = _ID_LETTER_MAP[v[0]]
+    digits = [letter_val // 10, letter_val % 10] + [int(c) for c in v[1:]]
+    weights = [1, 9, 8, 7, 6, 5, 4, 3, 2, 1, 1]
+    if sum(d * w for d, w in zip(digits, weights)) % 10 != 0:
+        return "身分證字號檢查碼錯誤"
+    return True
+
+
+def _validate_phone(v: str):
+    if not v.strip():
+        return True  # 選填
+    if not re.match(r'^09\d{8}$', v.strip()):
+        return "格式錯誤（10 碼數字，例：0912345678）"
+    return True
 
 
 class ConfirmTicketFlow:
@@ -63,8 +93,7 @@ class ConfirmTicketFlow:
 
     def _ask_membership(self) -> bool:
         console.print("\n[bold cyan]◆ 會員身分[/bold cyan]")
-        ans = input("  使用高鐵會員身分？(y/n，預設：n)：").strip().lower()
-        return ans == 'y'
+        return questionary.confirm("使用高鐵會員身分？", default=False, style=QUESTIONARY_STYLE).unsafe_ask() or False
 
     def set_personal_id(self) -> str:
         if self.cli_personal_id:
@@ -74,7 +103,11 @@ class ConfirmTicketFlow:
             return personal_id
 
         console.print("\n[bold cyan]◆ 乘客資訊[/bold cyan]")
-        return input("  輸入身分證字號：")
+        return questionary.text(
+            "輸入身分證字號",
+            style=QUESTIONARY_STYLE,
+            validate=_validate_personal_id,
+        ).unsafe_ask() or ''
 
     def set_phone_num(self) -> str:
         if self.cli_phone:
@@ -83,9 +116,12 @@ class ConfirmTicketFlow:
         if self.record and (phone_num := self.record.phone):
             return phone_num
 
-        if phone_num := input("  輸入手機號碼（選填）："):
-            return phone_num
-        return ''
+        return questionary.text(
+            "輸入手機號碼（選填）",
+            default='',
+            style=QUESTIONARY_STYLE,
+            validate=_validate_phone,
+        ).unsafe_ask() or ''
 
 
 def _select_membership(page: BeautifulSoup, personal_id: str, use_membership: bool = False) -> tuple:
@@ -121,20 +157,25 @@ def _process_early_bird(page: BeautifulSoup, personal_id: str) -> Optional[dict]
     params = {}
 
     console.print("\n[bold cyan]◆ 早鳥旅客資訊[/bold cyan]")
-    first_id = input(f"  旅客 1 身分證字號（預設：{personal_id}）：") or personal_id
+    first_id = questionary.text(
+        f"旅客 1 身分證字號",
+        default=personal_id,
+        style=QUESTIONARY_STYLE,
+        validate=_validate_personal_id,
+    ).unsafe_ask() or personal_id
     prefix = 'TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataView2'
     params[f'{prefix}:passengerDataLastName'] = ''
     params[f'{prefix}:passengerDataFirstName'] = ''
     params[f'{prefix}:passengerDataTypeName'] = early_type
-    params[f'{prefix}:passengerDataIdNumber'] = first_id
+    params[f'{prefix}:passengerDataIdNumber'] = first_id.strip()
     params[f'{prefix}:passengerDataInputChoice'] = '0'
 
     for i in range(1, passenger_count):
-        while True:
-            inp_id = input(f"  旅客 {i + 1} 身分證字號（確認後不可修改）：")
-            if inp_id.strip():
-                break
-            console.print("  [bold red]✗[/bold red]  身分證字號不可為空！")
+        inp_id = questionary.text(
+            f"旅客 {i + 1} 身分證字號（確認後不可修改）",
+            style=QUESTIONARY_STYLE,
+            validate=_validate_personal_id,
+        ).unsafe_ask() or ''
 
         prefix = f'TicketPassengerInfoInputPanel:passengerDataView:{i}:passengerDataView2'
         params[f'{prefix}:passengerDataLastName'] = ''

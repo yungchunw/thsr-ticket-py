@@ -1,12 +1,13 @@
 import io
 import json
+import re
+import questionary
 from PIL import Image
 from typing import Tuple, TYPE_CHECKING
 from datetime import date, timedelta
 
 from bs4 import BeautifulSoup
 from requests.models import Response
-from rich.columns import Columns
 
 from thsr_ticket.model.db import Record
 from thsr_ticket.remote.http_request import HTTPRequest
@@ -19,10 +20,34 @@ from thsr_ticket.configs.common import (
     MAX_TICKET_NUM,
     STATION_ZH,
 )
-from thsr_ticket.view.console import console
+from thsr_ticket.view.console import console, QUESTIONARY_STYLE
 
 if TYPE_CHECKING:
     from thsr_ticket.controller.booking_flow import CliOptions
+
+
+def _validate_date(v: str):
+    v = v.strip().replace('/', '-')
+    try:
+        d = date.fromisoformat(v)
+    except ValueError:
+        return "日期格式錯誤（YYYY/MM/DD）"
+    today = date.today()
+    last = today + timedelta(days=DAYS_BEFORE_BOOKING_AVAILABLE)
+    if d < today:
+        return f"日期不可早於今天（{today}）"
+    if d > last:
+        return f"日期不可晚於 {last}（最多提前 {DAYS_BEFORE_BOOKING_AVAILABLE} 天）"
+    return True
+
+
+def _format_time(t_str: str) -> str:
+    t_int = int(t_str[:-1])
+    if t_str[-1] == "A" and (t_int // 100) == 12:
+        t_int = t_int % 1200
+    elif t_int != 1230 and t_str[-1] == "P":
+        t_int += 1200
+    return f'{t_int // 100:02d}:{t_int % 100:02d}'
 
 
 class FirstPageFlow:
@@ -32,14 +57,11 @@ class FirstPageFlow:
         self.opts = opts
 
     def run(self) -> Tuple[Response, BookingModel, bytes]:
-        # First page. Booking options
         with console.status("[bold cyan]連線中...[/bold cyan]", spinner="dots"):
             book_page = self.client.request_booking_page().content
             img_resp = self.client.request_security_code_img(book_page).content
         page = BeautifulSoup(book_page, features='html.parser')
 
-        # Step 1: collect user inputs (interactive prompts) — done before captcha
-        # so user answers are preserved even if captcha solving fails
         start_station = self.select_station('啟程', self.opts.from_station if self.opts else None)
         dest_station = self.select_station('到達', self.opts.to_station if self.opts else None, default_value=StationMapping.Zuouing.value)
         outbound_date = self.select_date('出發', self.opts.date if self.opts else None)
@@ -47,19 +69,25 @@ class FirstPageFlow:
         adult_ticket_num = self.select_ticket_num(TicketType.ADULT, cli_count=self.opts.adult_count if self.opts else None)
         college_ticket_num = self._format_ticket(TicketType.COLLEGE, self.opts.student_count if self.opts else None)
         seat_prefer = self.select_seat_prefer(page, self.opts.seat_prefer if self.opts else None)
+
         if self.opts and self.opts.class_type is not None:
             class_type = self.opts.class_type
         else:
-            console.print("\n[bold cyan]◆ 車廂類型[/bold cyan]")
-            console.print("  [dim] 0[/dim]  標準車廂   [dim] 1[/dim]  商務車廂")
-            sel = input("  輸入選擇（預設：0）：").strip() or '0'
-            class_type = int(sel)
+            class_type = questionary.select(
+                "車廂類型",
+                choices=[
+                    questionary.Choice("標準車廂", value=0),
+                    questionary.Choice("商務車廂", value=1),
+                ],
+                default=0,
+                style=QUESTIONARY_STYLE,
+            ).unsafe_ask()
             if self.opts:
                 self.opts.class_type = class_type
+
         types_of_trip = _parse_types_of_trip_value(page)
         search_by = _parse_search_by(page)
 
-        # Cache answers back into opts so retries skip re-asking
         if self.opts:
             if self.opts.from_station is None:
                 self.opts.from_station = start_station
@@ -81,7 +109,6 @@ class FirstPageFlow:
             if self.opts.class_type is None:
                 self.opts.class_type = class_type
 
-        # Step 2: solve captcha (may raise LowConfidenceError — user answers already saved)
         security_code = _solve_captcha(img_resp, self.opts.auto_captcha if self.opts else False)
 
         with console.status("[bold cyan]提交訂票資訊...[/bold cyan]", spinner="dots"):
@@ -118,16 +145,17 @@ class FirstPageFlow:
         ):
             return station
 
-        console.print(f"\n[bold cyan]◆ 選擇{travel_type}站[/bold cyan]")
-        items = [
-            f"[dim]{s.value:>2}[/dim]  {STATION_ZH.get(s.value, s.name)}"
+        choices = [
+            questionary.Choice(title=STATION_ZH.get(s.value, s.name), value=s.value)
             for s in StationMapping
         ]
-        console.print(Columns(items, equal=True, padding=(0, 2)))
-        return int(
-            input(f"  輸入選擇（預設：{default_value}）：")
-            or default_value
-        )
+        default_choice = next((c for c in choices if c.value == default_value), choices[0])
+        return questionary.select(
+            f"選擇{travel_type}站",
+            choices=choices,
+            default=default_choice,
+            style=QUESTIONARY_STYLE,
+        ).unsafe_ask()
 
     def select_date(self, date_type: str, cli_value: str = None) -> str:
         if cli_value is not None:
@@ -135,8 +163,14 @@ class FirstPageFlow:
 
         today = date.today()
         last_avail_date = today + timedelta(days=DAYS_BEFORE_BOOKING_AVAILABLE)
-        console.print(f"\n[bold cyan]◆ 選擇{date_type}日期[/bold cyan]  [dim]{today} ~ {last_avail_date}[/dim]")
-        return input("  輸入日期（預設：今日）：") or str(today)
+        console.print(f"\n[dim]可預訂範圍：{today} ~ {last_avail_date}[/dim]")
+        raw = questionary.text(
+            "輸入出發日期",
+            default=str(today),
+            style=QUESTIONARY_STYLE,
+            validate=_validate_date,
+        ).unsafe_ask() or str(today)
+        return raw.strip().replace('-', '/')
 
     def select_time(self, time_type: str, cli_value: int = None, default_value: int = 10) -> str:
         if cli_value is not None:
@@ -150,20 +184,13 @@ class FirstPageFlow:
         ):
             return time_str
 
-        console.print("\n[bold cyan]◆ 選擇出發時間[/bold cyan]")
-        items = []
-        for idx, t_str in enumerate(AVAILABLE_TIME_TABLE, 1):
-            t_int = int(t_str[:-1])
-            if t_str[-1] == "A" and (t_int // 100) == 12:
-                t_int = "{:04d}".format(t_int % 1200)  # type: ignore
-            elif t_int != 1230 and t_str[-1] == "P":
-                t_int += 1200
-            t_str_fmt = str(t_int)
-            items.append(f"[dim]{idx:>2}[/dim]  {t_str_fmt[:-2]}:{t_str_fmt[-2:]}")
-        console.print(Columns(items, equal=True, padding=(0, 1), column_first=True))
-
-        selected_opt = int(input(f"  輸入選擇（預設：{default_value}）：") or default_value)
-        return AVAILABLE_TIME_TABLE[selected_opt-1]
+        choices = [
+            questionary.Choice(title=_format_time(t), value=t)
+            for t in AVAILABLE_TIME_TABLE
+        ]
+        default_t = AVAILABLE_TIME_TABLE[default_value - 1]
+        default_choice = next((c for c in choices if c.value == default_t), choices[0])
+        return questionary.select("選擇出發時間", choices=choices, default=default_choice, style=QUESTIONARY_STYLE).unsafe_ask()
 
     def select_ticket_num(self, ticket_type: TicketType, default_ticket_num: int = 1, cli_count: int = None) -> str:
         if cli_count is not None:
@@ -188,9 +215,9 @@ class FirstPageFlow:
             TicketType.COLLEGE: '大學生',
         }.get(ticket_type)
 
-        console.print(f"\n[bold cyan]◆ {ticket_type_name}票數[/bold cyan]  [dim]0 ~ {MAX_TICKET_NUM}[/dim]")
-        ticket_num = int(input(f"  輸入票數（預設：{default_ticket_num}）：") or default_ticket_num)
-        return f'{ticket_num}{ticket_type.value}'
+        choices = [questionary.Choice(str(i), value=i) for i in range(MAX_TICKET_NUM + 1)]
+        result = questionary.select(f"{ticket_type_name}票數", choices=choices, default=default_ticket_num, style=QUESTIONARY_STYLE).unsafe_ask()
+        return f'{result}{ticket_type.value}'
 
     def _format_ticket(self, ticket_type: TicketType, cli_count: int = None) -> str:
         if cli_count is not None:
@@ -202,10 +229,16 @@ class FirstPageFlow:
         all_opts = options.find_all('option')
 
         if cli_value is None:
-            console.print("\n[bold cyan]◆ 座位偏好[/bold cyan]")
-            console.print("  [dim] 0[/dim]  無偏好   [dim] 1[/dim]  靠窗   [dim] 2[/dim]  走道")
-            sel = input("  輸入選擇（預設：0）：").strip() or '0'
-            cli_value = int(sel)
+            cli_value = questionary.select(
+                "座位偏好",
+                choices=[
+                    questionary.Choice("無偏好", value=0),
+                    questionary.Choice("靠窗", value=1),
+                    questionary.Choice("走道", value=2),
+                ],
+                default=0,
+                style=QUESTIONARY_STYLE,
+            ).unsafe_ask()
             if self.opts:
                 self.opts.seat_prefer = cli_value
 
@@ -234,7 +267,7 @@ def _parse_search_by(page: BeautifulSoup) -> str:
 
 def _solve_captcha(img_resp: bytes, auto_captcha: bool = False) -> str:
     if auto_captcha:
-        from thsr_ticket.ml.captcha_solver import solve, LowConfidenceError
+        from thsr_ticket.ml.captcha_solver import solve, LowConfidenceError  # noqa: F401
         code = solve(img_resp)
         console.print(f"[dim]自動辨識驗證碼：[/dim][bold yellow]{code}[/bold yellow]")
         return code
@@ -242,4 +275,4 @@ def _solve_captcha(img_resp: bytes, auto_captcha: bool = False) -> str:
     console.print("\n[bold cyan]◆ 驗證碼[/bold cyan]  [dim]（圖片即將開啟）[/dim]")
     image = Image.open(io.BytesIO(img_resp))
     image.show()
-    return input("  輸入驗證碼：")
+    return questionary.text("輸入驗證碼", style=QUESTIONARY_STYLE).unsafe_ask() or ''

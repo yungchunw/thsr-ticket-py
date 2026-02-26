@@ -1,3 +1,4 @@
+import os
 import sys
 import argparse
 
@@ -41,8 +42,42 @@ def list_time_table():
     console.print(Columns(items, equal=True, padding=(0, 1), column_first=True))
 
 
+def _load_config() -> dict:
+    """Load defaults from ~/.thsr.toml if it exists."""
+    config_path = os.path.expanduser('~/.thsr.toml')
+    if not os.path.exists(config_path):
+        return {}
+    try:
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib  # type: ignore[no-redef]
+    except ImportError:
+        console.print("[dim]提示：安裝 tomli 套件以支援設定檔功能[/dim]")
+        return {}
+    try:
+        with open(config_path, 'rb') as f:
+            return tomllib.load(f)
+    except Exception as e:
+        console.print(f"[bold yellow]⚠[/bold yellow]  讀取設定檔失敗：{e}")
+        return {}
+
+
+# CLI arg names that map directly to config file keys
+_CONFIG_KEYS = {
+    'from_station', 'to_station', 'date', 'time', 'adult_count',
+    'student_count', 'personal_id', 'phone', 'seat_prefer', 'class_type',
+    'snatch_end', 'snatch_interval', 'snatch_single',
+}
+
+
 def main():
-    parser = argparse.ArgumentParser(description='台灣高鐵自動訂票程式')
+    config = _load_config()
+
+    parser = argparse.ArgumentParser(
+        description='台灣高鐵自動訂票程式',
+        epilog='設定檔：~/.thsr.toml（可存常用預設值，CLI 參數優先）',
+    )
 
     # Booking options
     parser.add_argument('-f', '--from-station', type=int, metavar='ID', help='啟程站 ID (1-12)')
@@ -57,15 +92,24 @@ def main():
     parser.add_argument('-c', '--class-type', type=int, choices=[0, 1], metavar='N', help='車廂類型 0:標準 1:商務')
 
     # Snatch mode
-    parser.add_argument('--snatch-end', metavar='DATE', help='刷票模式：從 --date 開始逐日嘗試直到此日期（格式：YYYY/MM/DD）')
+    parser.add_argument('--snatch', action='store_true', help='當天搶票：同一天持續重試直到有票')
+    parser.add_argument('--snatch-end', metavar='DATE', help='跨日搶票：從 --date 開始逐日嘗試直到此日期（格式：YYYY/MM/DD）')
+    parser.add_argument('--snatch-interval', type=int, metavar='SECONDS', help='搶票輪詢間隔（秒）；設定後查無票時持續輪詢')
+    parser.add_argument('--train-id', type=int, metavar='N', help='指定搶特定車次（搭配搶票模式使用）')
 
     # Feature flags
     parser.add_argument('-C', '--no-auto-captcha', action='store_true', help='停用自動辨識驗證碼（改為手動輸入）')
     parser.add_argument('-m', '--use-membership', action='store_true', help='使用高鐵會員身分')
+    parser.add_argument('--dry-run', action='store_true', help='模擬模式：完整執行流程但不實際送出訂位')
 
     # Info commands
     parser.add_argument('--list-station', action='store_true', help='列出所有車站')
     parser.add_argument('--list-time-table', action='store_true', help='列出所有時間選項')
+
+    # Apply config file values as defaults (CLI args override)
+    config_defaults = {k: v for k, v in config.items() if k in _CONFIG_KEYS}
+    if config_defaults:
+        parser.set_defaults(**config_defaults)
 
     args = parser.parse_args()
 
@@ -90,9 +134,17 @@ def main():
         phone=args.phone,
         seat_prefer=args.seat_prefer,
         class_type=args.class_type,
+        preferred_train=args.train_id,
+        snatch_single=args.snatch,
         snatch_end=args.snatch_end,
+        snatch_interval=args.snatch_interval,
+        dry_run=args.dry_run,
     )
-    flow.run()
+    try:
+        flow.run()
+    except KeyboardInterrupt:
+        console.print("\n[dim]已中止。[/dim]")
+        raise SystemExit(0)
 
 
 if __name__ == "__main__":
